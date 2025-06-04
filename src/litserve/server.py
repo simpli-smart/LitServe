@@ -661,11 +661,11 @@ class LitServer:
     def _register_internal_endpoints(self):
         workers_ready = False
 
-        @self.app.get("/", dependencies=[Depends(no_auth())])
+        @self.app.get("/", dependencies=[Depends(no_auth)])
         async def index(request: Request) -> Response:
             return Response(content="api running")
 
-        @self.app.get(self.healthcheck_path, dependencies=[Depends(no_auth())])
+        @self.app.get(self.healthcheck_path, dependencies=[Depends(no_auth)])
         async def health(request: Request) -> Response:
             nonlocal workers_ready
             if not workers_ready:
