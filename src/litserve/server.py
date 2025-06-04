@@ -63,7 +63,7 @@ LIT_SERVER_API_KEY = os.environ.get("LIT_SERVER_API_KEY")
 MultiPartParser.max_file_size = sys.maxsize
 # renamed in PR: https://github.com/encode/starlette/pull/2780
 MultiPartParser.spool_max_size = sys.maxsize
-
+fill_token_in_request = os.getenv("GET_TOKEN_IN_REQUEST", "1")
 
 def no_auth():
     pass
@@ -282,6 +282,11 @@ class RegularRequestHandler(BaseRequestHandler):
         try:
             # Prepare request
             payload = await self._prepare_request(request, request_type)
+            token = None
+            if fill_token_in_request == "1":
+                token = request.headers.get("Authorization", "").replace("Bearer ", "")
+            
+            payload["token"] = token
 
             # Submit to worker
             uid, _ = await self._submit_request(payload)
@@ -323,6 +328,11 @@ class StreamingRequestHandler(BaseRequestHandler):
         try:
             # Prepare request
             payload = await self._prepare_request(request, request_type)
+            token = None
+            if fill_token_in_request == "1":
+                token = request.headers.get("Authorization", "").replace("Bearer ", "")
+            
+            payload["token"] = token
 
             # Submit to worker
             uid, _ = await self._submit_request(payload)
@@ -651,11 +661,11 @@ class LitServer:
     def _register_internal_endpoints(self):
         workers_ready = False
 
-        @self.app.get("/", dependencies=[Depends(self.setup_auth())])
+        @self.app.get("/", dependencies=[Depends(no_auth())])
         async def index(request: Request) -> Response:
-            return Response(content="litserve running")
+            return Response(content="api running")
 
-        @self.app.get(self.healthcheck_path, dependencies=[Depends(self.setup_auth())])
+        @self.app.get(self.healthcheck_path, dependencies=[Depends(no_auth())])
         async def health(request: Request) -> Response:
             nonlocal workers_ready
             if not workers_ready:
