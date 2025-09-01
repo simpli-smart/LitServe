@@ -21,7 +21,7 @@ import sys
 import time
 from abc import ABC
 from queue import Empty, Queue
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
 from starlette.formparsers import MultiPartParser
 
@@ -37,32 +37,69 @@ MultiPartParser.max_file_size = sys.maxsize
 # renamed in PR: https://github.com/encode/starlette/pull/2780
 MultiPartParser.spool_max_size = sys.maxsize
 
+_DEFAULT_STOP_LOOP_MESSAGE = "Received sentinel value, stopping loop"
+_SENTINEL_VALUE = (None, None, None, None)
 
-def _inject_context(context: Union[List[dict], dict], func, *args, **kwargs):
+
+def _inject_context(context: Union[list[dict], dict], func, *args, **kwargs):
     sig = inspect.signature(func)
     if "context" in sig.parameters:
         return func(*args, **kwargs, context=context)
     return func(*args, **kwargs)
 
 
-async def _async_inject_context(context: Union[List[dict], dict], func, *args, **kwargs):
-    sig = inspect.signature(func)
-    is_async_gen = inspect.isasyncgenfunction(func)
+async def _sync_fn_to_async_fn(func, *args, **kwargs):
+    if inspect.isgeneratorfunction(func):
 
-    if "context" in sig.parameters:
-        result = (
-            await func(*args, **kwargs, context=context) if not is_async_gen else func(*args, **kwargs, context=context)
-        )
-    else:
-        result = await func(*args, **kwargs) if not is_async_gen else func(*args, **kwargs)
+        async def async_fn(*args, **kwargs):
+            for item in func(*args, **kwargs):
+                yield item
+            return
+
+        return async_fn(*args, **kwargs)
+
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
+async def _handle_async_function(func, *args, **kwargs):
+    # Call the function based on its type
+    if inspect.isasyncgenfunction(func):
+        # Async generator - return directly (don't await)
+        return func(*args, **kwargs)
+    if asyncio.iscoroutinefunction(func):
+        # Async function - await the result
+        return await func(*args, **kwargs)
+
+    # Sync function - convert to async function, then await if result is awaitable
+    result = await _sync_fn_to_async_fn(func, *args, **kwargs)
+
+    # Check if the result is awaitable (coroutine)
+    if asyncio.iscoroutine(result):
+        return await result
 
     return result
+
+
+async def _async_inject_context(context: Union[list[dict], dict], func, *args, **kwargs):
+    sig = inspect.signature(func)
+
+    # Determine if we need to inject context
+    if "context" in sig.parameters:
+        kwargs["context"] = context
+
+    return await _handle_async_function(func, *args, **kwargs)
+
+
+class _StopLoopError(Exception):
+    def __init__(self, message: str = _DEFAULT_STOP_LOOP_MESSAGE):
+        self.message = message
+        super().__init__(self.message)
 
 
 def collate_requests(
     lit_api: LitAPI,
     request_queue: Queue,
-) -> Tuple[List, List]:
+) -> tuple[list, list]:
     payloads = []
     timed_out_uids = []
     entered_at = time.monotonic()
@@ -72,7 +109,10 @@ def collate_requests(
     if lit_api.batch_timeout == 0:
         while len(payloads) < lit_api.max_batch_size:
             try:
-                response_queue_id, uid, timestamp, x_enc = request_queue.get_nowait()
+                request_data = request_queue.get_nowait()
+                if request_data == _SENTINEL_VALUE:
+                    raise _StopLoopError()
+                response_queue_id, uid, timestamp, x_enc = request_data
                 if apply_timeout and time.monotonic() - timestamp > lit_api.request_timeout:
                     timed_out_uids.append((response_queue_id, uid))
                 else:
@@ -87,7 +127,10 @@ def collate_requests(
             break
 
         try:
-            response_queue_id, uid, timestamp, x_enc = request_queue.get(timeout=min(remaining_time, 0.001))
+            request_data = request_queue.get(timeout=min(remaining_time, 0.001))
+            if request_data == _SENTINEL_VALUE:
+                raise _StopLoopError()
+            response_queue_id, uid, timestamp, x_enc = request_data
             if apply_timeout and time.monotonic() - timestamp > lit_api.request_timeout:
                 timed_out_uids.append((response_queue_id, uid))
             else:
@@ -127,9 +170,9 @@ class _BaseLoop(ABC):
             device: str,
             worker_id: int,
             request_queue: Queue,
-            response_queues: List[Queue],
+            response_queues: list[Queue],
             stream: bool,
-            workers_setup_status: Dict[int, str],
+            workers_setup_status: dict[int, str],
             callback_runner: CallbackRunner,
         ):
             item = request_queue.get()
@@ -155,7 +198,7 @@ class _BaseLoop(ABC):
         lit_api: LitAPI,
         lit_spec: Optional[LitSpec],
         request_queue: Queue,
-        response_queues: List[Queue],
+        response_queues: list[Queue],
     ):
         pass
 
@@ -166,7 +209,7 @@ class _BaseLoop(ABC):
         worker_id: int,
         request_queue: Queue,
         transport: MessageTransport,
-        workers_setup_status: Dict[int, str],
+        workers_setup_status: dict[int, str],
         callback_runner: CallbackRunner,
     ):
         lit_spec = lit_api.spec
@@ -212,7 +255,7 @@ class _BaseLoop(ABC):
         worker_id: int,
         request_queue: Queue,
         transport: MessageTransport,
-        workers_setup_status: Dict[int, str],
+        workers_setup_status: dict[int, str],
         callback_runner: CallbackRunner,
     ):
         raise NotImplementedError
@@ -225,7 +268,7 @@ class LitLoop(_BaseLoop):
 
     def kill(self):
         try:
-            logger.info(f"Stop Server Requested - Kill parent pid [{self._server_pid}] from [{os.getpid()}]")
+            logger.debug(f"Stop Server Requested - Kill parent pid [{self._server_pid}] from [{os.getpid()}]")
             if sys.platform == "win32":
                 os.kill(self._server_pid, signal.SIGTERM)
         except PermissionError:
@@ -236,7 +279,7 @@ class LitLoop(_BaseLoop):
         self,
         lit_api: LitAPI,
         request_queue: Queue,
-    ):
+    ) -> tuple[list, list]:
         batches, timed_out_uids = collate_requests(
             lit_api,
             request_queue,
@@ -287,10 +330,13 @@ class DefaultLoop(LitLoop):
             return
 
         original = lit_api.unbatch.__code__ is LitAPI.unbatch.__code__
-        if not lit_api.stream and any([
-            inspect.isgeneratorfunction(lit_api.predict) or inspect.isasyncgenfunction(lit_api.predict),
-            inspect.isgeneratorfunction(lit_api.encode_response) or inspect.isasyncgenfunction(lit_api.encode_response),
-        ]):
+        if not lit_api.stream and any(
+            [
+                inspect.isgeneratorfunction(lit_api.predict) or inspect.isasyncgenfunction(lit_api.predict),
+                inspect.isgeneratorfunction(lit_api.encode_response)
+                or inspect.isasyncgenfunction(lit_api.encode_response),
+            ]
+        ):
             raise ValueError(
                 """When `stream=False`, `lit_api.predict`, `lit_api.encode_response` must not be
                 generator or async generator functions.
@@ -323,16 +369,18 @@ class DefaultLoop(LitLoop):
         if (
             lit_api.stream
             and lit_api.max_batch_size > 1
-            and not all([
-                inspect.isgeneratorfunction(lit_api.predict) or inspect.isasyncgenfunction(lit_api.predict),
-                inspect.isgeneratorfunction(lit_api.encode_response)
-                or inspect.isasyncgenfunction(lit_api.encode_response),
-                (
-                    original
-                    or inspect.isgeneratorfunction(lit_api.unbatch)
-                    or inspect.isasyncgenfunction(lit_api.unbatch)
-                ),
-            ])
+            and not all(
+                [
+                    inspect.isgeneratorfunction(lit_api.predict) or inspect.isasyncgenfunction(lit_api.predict),
+                    inspect.isgeneratorfunction(lit_api.encode_response)
+                    or inspect.isasyncgenfunction(lit_api.encode_response),
+                    (
+                        original
+                        or inspect.isgeneratorfunction(lit_api.unbatch)
+                        or inspect.isasyncgenfunction(lit_api.unbatch)
+                    ),
+                ]
+            )
         ):
             raise ValueError(
                 """When `stream=True` with max_batch_size > 1, `lit_api.predict`, `lit_api.encode_response` and
@@ -364,10 +412,13 @@ class DefaultLoop(LitLoop):
              """
             )
 
-        if lit_api.stream and not all([
-            inspect.isgeneratorfunction(lit_api.predict) or inspect.isasyncgenfunction(lit_api.predict),
-            inspect.isgeneratorfunction(lit_api.encode_response) or inspect.isasyncgenfunction(lit_api.encode_response),
-        ]):
+        if lit_api.stream and not all(
+            [
+                inspect.isgeneratorfunction(lit_api.predict) or inspect.isasyncgenfunction(lit_api.predict),
+                inspect.isgeneratorfunction(lit_api.encode_response)
+                or inspect.isasyncgenfunction(lit_api.encode_response),
+            ]
+        ):
             raise ValueError(
                 """When `stream=True` both `lit_api.predict` and
              `lit_api.encode_response` must generate values using `yield` (can be regular or async generators).

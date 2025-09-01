@@ -15,13 +15,13 @@ import asyncio
 import logging
 import time
 from queue import Empty, Queue
-from typing import Dict, Optional
+from typing import Optional
 
 from fastapi import HTTPException
 
 from litserve import LitAPI
 from litserve.callbacks import CallbackRunner, EventTypes
-from litserve.loops.base import DefaultLoop, _async_inject_context, _inject_context, collate_requests
+from litserve.loops.base import _SENTINEL_VALUE, DefaultLoop, _async_inject_context, _inject_context, _StopLoopError
 from litserve.specs.base import LitSpec
 from litserve.transport.base import MessageTransport
 from litserve.utils import LitAPIStatus, LoopResponseType, PickleableHTTPException
@@ -41,7 +41,11 @@ class SingleLoop(DefaultLoop):
         lit_spec = lit_spec or lit_api.spec
         while True:
             try:
-                response_queue_id, uid, timestamp, x_enc = request_queue.get(timeout=1.0)
+                request_data = request_queue.get(timeout=1.0)
+                if request_data == _SENTINEL_VALUE:
+                    logger.debug("Received sentinel value, stopping loop")
+                    return
+                response_queue_id, uid, timestamp, x_enc = request_data
             except (Empty, ValueError):
                 continue
             except KeyboardInterrupt:  # pragma: no cover
@@ -211,9 +215,11 @@ class SingleLoop(DefaultLoop):
             pending_tasks = set()
             while True:
                 try:
-                    response_queue_id, uid, timestamp, x_enc = await event_loop.run_in_executor(
-                        None, request_queue.get, 1.0
-                    )
+                    request_data = await event_loop.run_in_executor(None, request_queue.get, 1.0)
+                    if request_data == _SENTINEL_VALUE:
+                        logger.debug("Received sentinel value, stopping loop")
+                        return
+                    response_queue_id, uid, timestamp, x_enc = request_data
                 except (Empty, ValueError):
                     continue
                 except KeyboardInterrupt:
@@ -254,7 +260,7 @@ class SingleLoop(DefaultLoop):
                 task.add_done_callback(pending_tasks.discard)
 
         # Get the current event loop
-        loop = asyncio.get_event_loop()
+        loop = asyncio.new_event_loop()
 
         # Run the async process
         try:
@@ -269,7 +275,7 @@ class SingleLoop(DefaultLoop):
         worker_id: int,
         request_queue: Queue,
         transport: MessageTransport,
-        workers_setup_status: Dict[int, str],
+        workers_setup_status: dict[int, str],
         callback_runner: CallbackRunner,
         lit_spec: Optional[LitSpec] = None,
         stream: bool = False,
@@ -291,10 +297,14 @@ class BatchedLoop(DefaultLoop):
     ):
         lit_spec = lit_api.spec
         while True:
-            batches, timed_out_uids = collate_requests(
-                lit_api,
-                request_queue,
-            )
+            try:
+                batches, timed_out_uids = self.get_batch_requests(
+                    lit_api,
+                    request_queue,
+                )
+            except _StopLoopError:
+                logger.debug("Received sentinel value, stopping loop")
+                return
 
             for response_queue_id, uid in timed_out_uids:
                 logger.error(
@@ -391,7 +401,7 @@ class BatchedLoop(DefaultLoop):
         worker_id: int,
         request_queue: Queue,
         transport: MessageTransport,
-        workers_setup_status: Dict[int, str],
+        workers_setup_status: dict[int, str],
         callback_runner: CallbackRunner,
         lit_spec: Optional[LitSpec] = None,
         stream: bool = False,

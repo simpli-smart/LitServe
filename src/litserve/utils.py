@@ -12,16 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import base64
 import dataclasses
+import importlib.util
 import logging
 import os
 import pdb
 import pickle
 import sys
+import tempfile
+import time
 import uuid
+import warnings
+from abc import ABCMeta
+from collections.abc import AsyncIterator
 from contextlib import contextmanager
 from enum import Enum
-from typing import TYPE_CHECKING, Any, AsyncIterator, TextIO, Union
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, TextIO, Union
 
 from fastapi import HTTPException
 
@@ -29,6 +37,14 @@ if TYPE_CHECKING:
     from litserve.server import LitServer
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_LOG_FORMAT = (
+    "%(asctime)s - %(processName)s[%(process)d] - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
+)
+# Threshold for detecting heavy initialization tasks.
+# A value of 1 second was chosen based on empirical observations
+# of typical initialization times in this project.
+_INIT_THRESHOLD = 1
 
 
 class LitAPIStatus:
@@ -76,20 +92,28 @@ def wrap_litserve_start(server: "LitServer"):
         if lit_api.spec:
             lit_api.spec.response_queue_id = 0
 
-    manager = server._init_manager(1)
-    processes = []
+    server.manager = server._init_manager(1)
+    server.inference_workers = []
     for lit_api in server.litapi_connector:
-        processes.extend(server.launch_inference_worker(lit_api))
+        server.inference_workers.extend(server.launch_inference_worker(lit_api))
     server._prepare_app_run(server.app)
+    if is_package_installed("mcp"):
+        from litserve.mcp import _LitMCPServerConnector
+
+        server.mcp_server = _LitMCPServerConnector()
+    else:
+        server.mcp_server = None
+
     try:
         yield server
     finally:
+        server._shutdown_event.set()
         # First close the transport to signal to the response_queue_to_buffer task that it should stop
         server._transport.close()
-        for p in processes:
+        for p in server.inference_workers:
             p.terminate()
             p.join()
-        manager.shutdown()
+        server.manager.shutdown()
 
 
 async def call_after_stream(streamer: AsyncIterator, callback, *args, **kwargs):
@@ -119,7 +143,7 @@ def _get_default_handler(stream, format):
 
 def configure_logging(
     level: Union[str, int] = logging.INFO,
-    format: str = "%(asctime)s - %(processName)s[%(process)d] - %(name)s - %(levelname)s - %(message)s",
+    format: str = _DEFAULT_LOG_FORMAT,
     stream: TextIO = sys.stdout,
     use_rich: bool = False,
 ):
@@ -214,3 +238,104 @@ def set_trace_if_debug(debug_env_var="LITSERVE_DEBUG", debug_env_var_value="1"):
     """Set a tracepoint in the code if the environment variable LITSERVE_DEBUG is set."""
     if os.environ.get(debug_env_var) == debug_env_var_value:
         set_trace()
+
+
+def is_package_installed(package_name: str) -> bool:
+    spec = importlib.util.find_spec(package_name)
+    return spec is not None
+
+
+class _TimedInitMeta(ABCMeta):
+    def __new__(mcls, name, bases, namespace, **kwargs):
+        cls = super().__new__(mcls, name, bases, namespace, **kwargs)
+        cls._has_custom_setup = False
+
+        for base in bases:
+            if hasattr(base, "setup"):
+                base_setup = base.setup
+
+                if "setup" in namespace and namespace["setup"] is not base_setup:
+                    cls._has_custom_setup = True
+                    break
+        else:
+            if "setup" in namespace:
+                cls._has_custom_setup = True
+
+        return cls
+
+    def __call__(cls, *args, **kwargs):
+        start_time = time.perf_counter()
+        instance = super().__call__(*args, **kwargs)
+        elapsed = time.perf_counter() - start_time
+
+        if elapsed >= _INIT_THRESHOLD and not cls._has_custom_setup:
+            warnings.warn(
+                (
+                    f"{cls.__name__}.__init__ took {elapsed:.2f} seconds to execute. This suggests that you're "
+                    "loading a model or doing other heavy processing inside the constructor.\n\n"
+                    "To improve startup performance and avoid unnecessary work across processes, move any one-time "
+                    f"heavy initialization into the `{cls.__name__}.setup` method.\n\n"
+                    "The `LitAPI.setup` method is designed for deferred, process-specific loading — ideal for models "
+                    "and large resources."
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        return instance
+
+
+def add_ssl_context_from_env(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Loads SSL context from base64-encoded environment variables.
+
+    This function checks for the presence of `LIGHTNING_CERT_PEM` and
+    `LIGHTNING_KEY_FILE` environment variables. It expects these variables
+    to contain the SSL certificate and private key, respectively, as
+    base64-encoded PEM strings.
+
+    If both variables are found, it decodes them and writes the content to
+    secure, temporary files. The paths to these files are returned in a
+    dictionary suitable for direct use as keyword arguments in libraries
+    that require SSL file paths (like `uvicorn` or `requests`).
+
+    Note:
+        The temporary files are not automatically deleted (`delete=False`).
+        The calling application is responsible for cleaning up these files
+        after the SSL context is no longer needed to prevent leaving
+        sensitive data on disk.
+
+    Returns:
+        dict[str, Any]: A dictionary containing `ssl_certfile` and `ssl_keyfile`
+        keys with `pathlib.Path` objects pointing to the temporary files.
+        If either of the required environment variables is missing, it
+        returns an empty dictionary.
+
+    """
+
+    if "ssl_keyfile" in kwargs and "ssl_certfile" in kwargs:
+        return kwargs
+
+    cert_pem_b64 = os.getenv("LIGHTNING_CERT_PEM", "")
+    cert_key_b64 = os.getenv("LIGHTNING_KEY_FILE", "")
+
+    if cert_pem_b64 == "" or cert_key_b64 == "":
+        return kwargs
+
+    # Decode the base64 strings to get the actual PEM content
+    cert_pem = base64.b64decode(cert_pem_b64).decode("utf-8")
+    cert_key = base64.b64decode(cert_key_b64).decode("utf-8")
+
+    # Write to temporary files
+    with (
+        tempfile.NamedTemporaryFile(mode="w+", delete=False) as cert_file,
+        tempfile.NamedTemporaryFile(mode="w+", delete=False) as key_file,
+    ):
+        cert_file.write(cert_pem)
+        cert_file.flush()
+        key_file.write(cert_key)
+        key_file.flush()
+
+        logger.info("Loading TLS Certificates \n")
+
+        # Return a dictionary with Path objects to the created files
+        return {"ssl_keyfile": Path(key_file.name), "ssl_certfile": Path(cert_file.name), **kwargs}

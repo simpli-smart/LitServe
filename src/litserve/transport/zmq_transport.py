@@ -20,7 +20,7 @@ class ZMQTransport(MessageTransport):
         elif operation == zmq.SUB:
             self._zmq = AsyncConsumer(consumer_id=consumer_id, address=self.frontend_address)
         else:
-            ValueError(f"Invalid operation {operation}")
+            raise ValueError(f"Invalid operation {operation}")
 
     def send(self, item: Any, consumer_id: int) -> None:
         if self._zmq is None:
@@ -32,7 +32,7 @@ class ZMQTransport(MessageTransport):
             self.setup(zmq.SUB, consumer_id)
         return await self._zmq.get(timeout=timeout)
 
-    def close(self) -> None:
+    def close(self, **kwargs) -> None:
         if self._zmq:
             self._zmq.close()
         else:

@@ -13,7 +13,6 @@
 # limitations under the License.
 import logging
 from queue import Queue
-from typing import Dict
 
 from litserve import LitAPI
 from litserve.callbacks import CallbackRunner, EventTypes
@@ -64,10 +63,9 @@ def inference_worker(
     worker_id: int,
     request_queue: Queue,
     transport: MessageTransport,
-    workers_setup_status: Dict[int, str],
+    workers_setup_status: dict[int, str],
     callback_runner: CallbackRunner,
 ):
-    print("workers_setup_status", workers_setup_status)
     lit_spec = lit_api.spec
     loop: LitLoop = lit_api.loop
     stream = lit_api.stream
@@ -83,8 +81,6 @@ def inference_worker(
         return
     lit_api.device = device
     callback_runner.trigger_event(EventTypes.AFTER_SETUP.value, lit_api=lit_api)
-
-    print(f"Setup complete for worker {f'{endpoint}_{worker_id}'}.")
 
     if workers_setup_status:
         workers_setup_status[f"{endpoint}_{worker_id}"] = WorkerSetupStatus.READY

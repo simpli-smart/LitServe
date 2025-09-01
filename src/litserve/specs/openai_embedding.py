@@ -17,12 +17,14 @@ import logging
 import sys
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, List, Literal, Optional, Union
+import warnings
+from typing import TYPE_CHECKING, Any, Literal, Optional, Union
 
 from fastapi import HTTPException, Request, Response, status
 from fastapi import status as status_code
 from pydantic import BaseModel
 
+from litserve.constants import _DEFAULT_LIT_API_PATH
 from litserve.specs.base import LitSpec
 from litserve.utils import LitAPIStatus
 
@@ -32,11 +34,11 @@ if TYPE_CHECKING:
     import numpy as np
     import torch
 
-    from litserve import LitServer
+    from litserve import LitAPI, LitServer
 
 
 class EmbeddingRequest(BaseModel):
-    input: Union[str, List[str], List[int], List[List[int]]]
+    input: Union[str, list[str], list[int], list[list[int]]]
     model: str
     dimensions: Optional[int] = None
     encoding_format: Literal["float", "base64"] = "float"
@@ -56,7 +58,7 @@ class EmbeddingRequest(BaseModel):
 
 class Embedding(BaseModel):
     index: int
-    embedding: List[float]
+    embedding: list[float]
     object: Literal["embedding"] = "embedding"
 
 
@@ -66,7 +68,7 @@ class UsageInfo(BaseModel):
 
 
 class EmbeddingResponse(BaseModel):
-    data: List[Embedding]
+    data: list[Embedding]
     model: str
     object: Literal["list"] = "list"
     usage: UsageInfo
@@ -85,7 +87,7 @@ class TestAPI(ls.LitAPI):
     def setup(self, device):
         self.model = None
 
-    def predict(self, inputs) -> List[List[float]]:
+    def predict(self, inputs) -> list[list[float]]:
         # inputs is a string
         return np.random.rand(1, 768).tolist()
 
@@ -109,8 +111,8 @@ class TestAPI(ls.LitAPI):
     def setup(self, device):
         self.model = None
 
-    def predict(self, inputs) -> List[List[float]]:
-        # inputs is a list of texts (List[str])
+    def predict(self, inputs) -> list[list[float]]:
+        # inputs is a list of texts (list[str])
         return np.random.rand(len(inputs), 768)
 
 if __name__ == "__main__":
@@ -124,17 +126,26 @@ if __name__ == "__main__":
 class OpenAIEmbeddingSpec(LitSpec):
     def __init__(self):
         super().__init__()
-        # register the endpoint
         self.api_path = "/v1/embeddings"  # default api path
-        self.add_endpoint("/v1/embeddings", self.embeddings_endpoint, ["POST"])
-        self.add_endpoint("/v1/embeddings", self.options_embeddings, ["GET"])
 
-    def setup(self, server: "LitServer"):
+    def pre_setup(self, lit_api: "LitAPI"):
         from litserve import LitAPI
 
-        super().setup(server)
+        # Override the spec's api_path only if provided
+        if lit_api._api_path and lit_api._api_path not in (_DEFAULT_LIT_API_PATH, self.api_path):
+            self.api_path = lit_api._api_path
+            warnings.warn(
+                f"Custom API path detected: '{self.api_path}'. "
+                "The OpenAI SDK only supports the default path '/v1/embeddings'. "
+                f"To use '{self.api_path}', send HTTP requests directly or use a client that supports custom endpoints."
+                " For SDK compatibility, use the default path."
+            )
 
-        lit_api = server.lit_api
+        # register the endpoint
+        self.add_endpoint(self.api_path, self.embeddings_endpoint, ["POST"])
+        self.add_endpoint(self.api_path, self.options_embeddings, ["GET"])
+
+        # validate LitAPI methods
         if inspect.isgeneratorfunction(lit_api.predict):
             raise ValueError(
                 "You are using yield in your predict method, which is used for streaming.",
@@ -154,13 +165,15 @@ class OpenAIEmbeddingSpec(LitSpec):
                 EMBEDDING_API_EXAMPLE,
             )
 
+    def setup(self, server: "LitServer"):
+        super().setup(server)
         print("OpenAI Embedding Spec is ready.")
 
-    def decode_request(self, request: EmbeddingRequest, context_kwargs: Optional[dict] = None) -> List[str]:
+    def decode_request(self, request: EmbeddingRequest, context_kwargs: Optional[dict] = None) -> list[str]:
         return request.input
 
     def encode_response(
-        self, output: List[List[float]], context_kwargs: Optional[dict] = None
+        self, output: list[list[float]], context_kwargs: Optional[dict] = None
     ) -> Union[dict, EmbeddingResponse]:
         usage = {
             "prompt_tokens": context_kwargs.get("prompt_tokens", 0) if context_kwargs else 0,
@@ -168,7 +181,7 @@ class OpenAIEmbeddingSpec(LitSpec):
         }
         return {"embeddings": output} | usage
 
-    def _validate_response(self, response: Union[dict, List[Embedding], Any]) -> None:
+    def _validate_response(self, response: Union[dict, list[Embedding], Any]) -> None:
         if isinstance(response, list) and all(isinstance(item, Embedding) for item in response):
             return
         if not isinstance(response, (dict, EmbeddingResponse)):
@@ -190,8 +203,8 @@ class OpenAIEmbeddingSpec(LitSpec):
             )
 
     def _handle_embedding_response(
-        self, embeddings: Union[List, "np.ndarray", "torch.Tensor", "List[List[float]]"], num_items: int = 1
-    ) -> List[Embedding]:
+        self, embeddings: Union[list, "np.ndarray", "torch.Tensor", "list[list[float]]"], num_items: int = 1
+    ) -> list[Embedding]:
         ndim = None
         if "torch" in sys.modules:
             import torch
@@ -263,7 +276,7 @@ class OpenAIEmbeddingSpec(LitSpec):
         logger.debug(response)
 
         self._validate_response(response)
-        data: List[Embedding] = self._handle_embedding_response(response["embeddings"], num_items)
+        data: list[Embedding] = self._handle_embedding_response(response["embeddings"], num_items)
 
         usage = UsageInfo(**response)
 

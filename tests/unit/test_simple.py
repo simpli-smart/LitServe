@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
@@ -19,10 +20,11 @@ from contextlib import ExitStack
 import numpy as np
 import pytest
 from asgi_lifespan import LifespanManager
-from fastapi import Request, Response
+from fastapi import Request, Response, status
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
+import litserve.server
 from litserve import LitAPI, LitServer
 from litserve.utils import wrap_litserve_start
 
@@ -170,6 +172,51 @@ def test_load(lit_server):
             assert el == {"output": i**2}
 
 
+@pytest.fixture
+def shutdown_api_key():
+    api_key = f"test-key-{random.randint(100, 1000000)}"
+    litserve.server.SHUTDOWN_API_KEY = api_key
+    yield api_key
+    litserve.server.SHUTDOWN_API_KEY = None
+
+
+def test_shutdown_endpoint_single_worker(shutdown_api_key):
+    server = LitServer(
+        SimpleLitAPI(),
+        accelerator="cpu",
+        devices=1,
+        workers_per_device=1,
+        enable_shutdown_api=True,
+    )
+
+    with wrap_litserve_start(server) as srv, TestClient(srv.app) as client:
+        response_no_header = client.post("/shutdown")
+        assert response_no_header.status_code == 401
+
+        response_correct_key = client.post("/shutdown", headers={"Authorization": f"Bearer {shutdown_api_key}"})
+        assert response_correct_key.status_code == status.HTTP_200_OK
+
+
+def test_shutdown_endpoint_multiple_workers(shutdown_api_key):
+    server = LitServer(
+        SimpleLitAPI(),
+        accelerator="cpu",
+        devices=1,
+        workers_per_device=3,
+        enable_shutdown_api=True,
+    )
+
+    with wrap_litserve_start(server) as srv, TestClient(srv.app) as client:
+        response_no_header = client.post("/shutdown")
+        assert response_no_header.status_code == 401
+
+        response_wrong_key = client.post("/shutdown", headers={"Authorization": "Bearer wrong_key"})
+        assert response_wrong_key.status_code == 401
+
+        response_correct_key = client.post("/shutdown", headers={"Authorization": f"Bearer {shutdown_api_key}"})
+        assert response_correct_key.status_code == status.HTTP_200_OK
+
+
 class SlowLitAPI(LitAPI):
     def setup(self, device):
         self.model = lambda x: x**2
@@ -201,9 +248,10 @@ async def test_timeout(use_zmq):
     api = SlowLitAPI()  # takes 2 seconds for each prediction
     server = LitServer(api, accelerator="cpu", devices=1, timeout=2, fast_queue=use_zmq)
     with wrap_litserve_start(server) as server:
-        async with LifespanManager(server.app) as manager, AsyncClient(
-            transport=ASGITransport(app=manager.app), base_url="http://test"
-        ) as ac:
+        async with (
+            LifespanManager(server.app) as manager,
+            AsyncClient(transport=ASGITransport(app=manager.app), base_url="http://test") as ac,
+        ):
             response1 = asyncio.create_task(ac.post("/predict", json={"input": 4.0}))
             await asyncio.sleep(0.0001)
             response2 = asyncio.create_task(ac.post("/predict", json={"input": 5.0}))
@@ -230,9 +278,10 @@ async def test_batch_timeout_with_concurrent_requests(use_zmq):
         fast_queue=use_zmq,
     )
     with wrap_litserve_start(server) as server:
-        async with LifespanManager(server.app) as manager, AsyncClient(
-            transport=ASGITransport(app=manager.app), base_url="http://test"
-        ) as ac:
+        async with (
+            LifespanManager(server.app) as manager,
+            AsyncClient(transport=ASGITransport(app=manager.app), base_url="http://test") as ac,
+        ):
             response1 = asyncio.create_task(ac.post("/predict", json={"input": 4.0}))
             response2 = asyncio.create_task(ac.post("/predict", json={"input": 5.0}))
             await asyncio.sleep(0.0001)

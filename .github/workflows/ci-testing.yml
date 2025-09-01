@@ -5,6 +5,8 @@ on:
     branches: [main, "release/*"]
   pull_request:
     branches: [main, "release/*"]
+  schedule:
+    - cron: "0 0 * * *" # every day at midnight UTC
 
 defaults:
   run:
@@ -28,29 +30,34 @@ jobs:
       TORCH_URL: "https://download.pytorch.org/whl/cpu/torch_stable.html"
 
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - name: Install uv and setup python
+        uses: astral-sh/setup-uv@v6
         with:
+          activate-environment: true
           python-version: ${{ matrix.python-version }}
-          cache: "pip"
+          enable-cache: true
+
+      - name: Set up dependencies
+        run: |
+          uv pip compile pyproject.toml -o requirements.txt
+          cat requirements.txt
 
       - name: Set min. dependencies
         if: matrix.requires == 'oldest'
         run: |
-          pip install 'lightning-utilities[cli]'
-          python -m lightning_utilities.cli requirements set-oldest --req_files='["requirements.txt", "_requirements/test.txt"]'
+          uv pip install 'lightning-utilities[cli]>=0.15.1'
+          uv run python -m lightning_utilities.cli requirements set-oldest --req_files=pyproject.toml
 
-      - name: Install package & dependencies
+      - name: Install package
         run: |
-          pip --version
-          pip install -e '.[test]' -U -q --find-links $TORCH_URL
-          pip list
+          uv pip list
+          uv sync --all-extras --dev
+          uv pip list
 
       - name: Tests
-        timeout-minutes: 10
-        run: |
-          python -m pytest --cov=litserve src/ tests/ -v -s
+        timeout-minutes: 15
+        run: pytest --cov=litserve tests/ -v -s --durations=100
 
       - name: Statistics
         run: |
@@ -58,7 +65,7 @@ jobs:
           coverage xml
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           file: ./coverage.xml

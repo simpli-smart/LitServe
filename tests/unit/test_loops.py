@@ -19,8 +19,9 @@ import json
 import re
 import threading
 import time
+from collections.abc import AsyncGenerator
 from queue import Empty, Queue
-from typing import Dict, List, Optional
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -33,7 +34,13 @@ import litserve as ls
 from litserve import LitAPI
 from litserve.callbacks import CallbackRunner
 from litserve.loops import BatchedStreamingLoop, LitLoop, Output, StreamingLoop, inference_worker
-from litserve.loops.base import DefaultLoop
+from litserve.loops.base import (
+    _SENTINEL_VALUE,
+    DefaultLoop,
+    _async_inject_context,
+    _handle_async_function,
+    _sync_fn_to_async_fn,
+)
 from litserve.loops.continuous_batching_loop import (
     ContinuousBatchingLoop,
     notify_timed_out_requests,
@@ -82,7 +89,7 @@ class TestQueue(Queue):
             raise Empty  # Simulate queue being empty after sentinel
         item = super().get(timeout=timeout)
         # Sentinel: (None, None, None, None)
-        if item == (None, None, None, None):
+        if item == _SENTINEL_VALUE:
             self._sentinel_seen = True
             raise KeyboardInterrupt  # Triggers loop exit in your code
         return item
@@ -107,7 +114,7 @@ def async_loop_args():
     requests_queue = TestQueue()
     requests_queue.put((0, "uuid-123", time.monotonic(), {"input": 1}))
     requests_queue.put((1, "uuid-234", time.monotonic(), {"input": 2}))
-    requests_queue.put((None, None, None, None))
+    requests_queue.put(_SENTINEL_VALUE)
 
     lit_api = AsyncTestLitAPI()
     return lit_api, requests_queue
@@ -235,7 +242,7 @@ class AsyncTestStreamLitAPI(LitAPI):
             yield {"output": i}
 
     async def encode_response(self, output):
-        for out in output:
+        async for out in output:
             yield out["output"]
 
 
@@ -263,7 +270,7 @@ async def test_streaming_loop_process_streaming_request(mock_transport):
 def test_run_streaming_loop_with_async(mock_transport, monkeypatch):
     requests_queue = TestQueue()
     requests_queue.put((0, "uuid-123", time.monotonic(), {"input": 5}))
-    requests_queue.put((None, None, None, None))  # Sentinel to stop the loop
+    requests_queue.put(_SENTINEL_VALUE)  # Sentinel to stop the loop
 
     lit_api = AsyncTestStreamLitAPI()
     loop = StreamingLoop()
@@ -412,7 +419,7 @@ async def test_run_single_loop(mock_transport):
     time.sleep(1)
 
     # Stop the loop by putting a sentinel value in the queue
-    request_queue.put((None, None, None, None))
+    request_queue.put(_SENTINEL_VALUE)
     loop_thread.join()
 
     response = await transport.areceive(consumer_id=0)
@@ -445,7 +452,7 @@ async def test_run_single_loop_timeout():
     assert response.status_code == 504
     assert "Request UUID-001 was waiting in the queue for too long" in stream.getvalue()
 
-    request_queue.put((None, None, None, None))
+    request_queue.put(_SENTINEL_VALUE)
     loop_thread.join()
 
 
@@ -481,7 +488,7 @@ async def test_run_batched_loop():
         actual = await transport.areceive(0, timeout=10)
         assert actual == expected, f"Expected {expected}, got {actual}"
 
-    request_queue.put((None, None, None, None))
+    request_queue.put(_SENTINEL_VALUE)
     loop_thread.join()
 
 
@@ -524,7 +531,7 @@ async def test_run_batched_loop_timeout(mock_transport):
     _, (response2, _, _) = await transport.areceive(consumer_id=0, timeout=10)
     assert response2 == {"output": 25.0}
 
-    request_queue.put((None, None, None, None))
+    request_queue.put(_SENTINEL_VALUE)
     loop_thread.join()
 
 
@@ -548,7 +555,7 @@ async def test_run_streaming_loop(mock_transport):
     time.sleep(1)
 
     # Stop the loop by putting a sentinel value in the queue
-    request_queue.put((None, None, None, None))
+    request_queue.put(_SENTINEL_VALUE)
     loop_thread.join()
 
     for i in range(3):
@@ -579,7 +586,7 @@ async def test_run_streaming_loop_timeout(mock_transport):
     time.sleep(1)
 
     # Stop the loop by putting a sentinel value in the queue
-    request_queue.put((None, None, None, None))
+    request_queue.put(_SENTINEL_VALUE)
     loop_thread.join()
 
     assert "Request UUID-001 was waiting in the queue for too long" in stream.getvalue()
@@ -617,7 +624,7 @@ def off_test_run_batched_streaming_loop(openai_request_data):
     time.sleep(1)
 
     # Stop the loop by putting a sentinel value in the queue
-    request_queue.put((None, None, None, None))
+    request_queue.put(_SENTINEL_VALUE)
     loop_thread.join()
 
     response = response_queues[0].get(timeout=5)[1]
@@ -632,7 +639,7 @@ class TestLoop(LitLoop):
         worker_id: int,
         request_queue: Queue,
         transport: MessageTransport,
-        workers_setup_status: Dict[int, str],
+        workers_setup_status: dict[int, str],
         callback_runner: CallbackRunner,
     ):
         try:
@@ -655,7 +662,7 @@ class TestLoop(LitLoop):
         worker_id: int,
         request_queue: Queue,
         transport: MessageTransport,
-        workers_setup_status: Dict[int, str],
+        workers_setup_status: dict[int, str],
         callback_runner: CallbackRunner,
     ):
         item = request_queue.get()
@@ -701,9 +708,10 @@ async def test_loop_with_server_async(fast_queue):
     server = ls.LitServer(lit_api, loop=loop, fast_queue=fast_queue)
 
     with wrap_litserve_start(server) as server:
-        async with LifespanManager(server.app) as manager, AsyncClient(
-            transport=ASGITransport(app=manager.app), base_url="http://test"
-        ) as ac:
+        async with (
+            LifespanManager(server.app) as manager,
+            AsyncClient(transport=ASGITransport(app=manager.app), base_url="http://test") as ac,
+        ):
             response = await ac.post("/predict", json={"input": 4.0}, timeout=5)
             assert response.json() == {"output": 1600.0}
 
@@ -836,7 +844,7 @@ class ContinuousBatchingAPI(ls.LitAPI):
     def has_active_requests(self) -> bool:
         return bool(self.model)
 
-    def step(self, prev_outputs: Optional[List[Output]]) -> List[Output]:
+    def step(self, prev_outputs: Optional[list[Output]]) -> list[Output]:
         outputs = []
         for k in self.model:
             v = self.model[k]
@@ -918,3 +926,44 @@ async def test_continuous_batching_run(continuous_batching_setup):
     assert o == ""
     assert status == LitAPIStatus.FINISH_STREAMING
     assert response_type == LoopResponseType.STREAMING
+
+
+@pytest.mark.asyncio
+async def test_handle_async_function():
+    async def async_func():
+        return "async"
+
+    def sync_func():
+        return "sync"
+
+    async def async_gen():
+        for i in range(3):
+            yield i
+
+    assert await _handle_async_function(async_func) == "async"
+    assert await _handle_async_function(sync_func) == "sync"
+    async_gen = await _handle_async_function(async_gen)
+    assert isinstance(async_gen, AsyncGenerator)
+
+
+@pytest.mark.asyncio
+async def test_async_inject_context():
+    async def async_func(x, context=0):
+        return x * context["a"]
+
+    context = {"a": 1}
+    assert await _async_inject_context(context, async_func, 2) == 2
+
+
+@pytest.mark.asyncio
+async def test_sync_fn_to_async_fn():
+    def sync_func():
+        return "sync-to-async"
+
+    def sync_gen():
+        for i in range(3):
+            yield f"sync-to-async-{i}"
+
+    assert await _sync_fn_to_async_fn(sync_func) == "sync-to-async"
+    async_gen = await _sync_fn_to_async_fn(sync_gen)
+    assert isinstance(async_gen, AsyncGenerator)

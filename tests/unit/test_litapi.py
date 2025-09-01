@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import time
 
 import numpy as np
 import pytest
@@ -142,15 +143,7 @@ def test_decode_request_with_openai_spec():
     api.pre_setup(spec=ls.OpenAISpec())
     request = ChatCompletionRequest(messages=[{"role": "system", "content": "Hello"}])
     decoded_request = api.decode_request(request)
-    assert decoded_request[0]["content"] == "Hello", "Decode request should return the input message"
-
-
-def test_decode_request_with_openai_spec_wrong_request():
-    api = ls.test_examples.TestAPI(max_batch_size=1)
-    api.request_timeout = 30
-    api.pre_setup(spec=ls.OpenAISpec())
-    with pytest.raises(AttributeError, match="object has no attribute 'messages'"):
-        api.decode_request({"input": "Hello"})
+    assert decoded_request.messages[0].content == "Hello", "Decode request should return the input message"
 
 
 def test_encode_response():
@@ -285,5 +278,41 @@ def test_log():
 
 
 def test_enable_async_not_set():
-    with pytest.raises(ValueError, match=r"LitAPI\(enable_async=True\) requires all methods to be coroutines\."):
+    with pytest.raises(
+        ValueError, match=r"predict must be an async generator or async function when enable_async=True"
+    ):
         ls.test_examples.SimpleLitAPI(enable_async=True)
+
+
+class HeavyInitAPI(ls.LitAPI):
+    def __init__(self):
+        super().__init__()
+        time.sleep(2)
+
+
+class HeavyInitAPIWithSetup(HeavyInitAPI):
+    def setup(self, device):
+        pass
+
+
+class HeavySetupAPI(ls.LitAPI):
+    def setup(self, device):
+        time.sleep(2)
+
+
+def test_heavy_init_api_no_setup():
+    with pytest.warns(RuntimeWarning, match="loading a model or doing other heavy processing inside the constructor"):
+        HeavyInitAPI()
+
+
+def test_heavy_init_api_with_setup(recwarn):
+    HeavyInitAPIWithSetup()
+
+    assert len(recwarn) == 0
+
+
+def test_heavy_setup_api(recwarn):
+    api = HeavySetupAPI()
+    api.setup("")
+
+    assert len(recwarn) == 0

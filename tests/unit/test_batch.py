@@ -14,7 +14,7 @@
 import asyncio
 import time
 from queue import Queue
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -26,9 +26,10 @@ from httpx import ASGITransport, AsyncClient
 import litserve as ls
 from litserve import LitAPI, LitServer
 from litserve.callbacks import CallbackRunner
-from litserve.loops.base import collate_requests
+from litserve.loops.base import _SENTINEL_VALUE, _StopLoopError, collate_requests
 from litserve.loops.simple_loops import BatchedLoop
-from litserve.utils import wrap_litserve_start
+from litserve.transport.base import MessageTransport
+from litserve.utils import LoopResponseType, wrap_litserve_start
 
 NOOP_CB_RUNNER = CallbackRunner()
 
@@ -92,9 +93,10 @@ async def test_batched():
     server = LitServer(api, accelerator="cpu", devices=1, timeout=10)
 
     with wrap_litserve_start(server) as server:
-        async with LifespanManager(server.app) as manager, AsyncClient(
-            transport=ASGITransport(app=manager.app), base_url="http://test"
-        ) as ac:
+        async with (
+            LifespanManager(server.app) as manager,
+            AsyncClient(transport=ASGITransport(app=manager.app), base_url="http://test") as ac,
+        ):
             response1 = ac.post("/predict", json={"input": 4.0})
             response2 = ac.post("/predict", json={"input": 5.0})
             response1, response2 = await asyncio.gather(response1, response2)
@@ -110,9 +112,10 @@ async def test_unbatched():
     api.pre_setup(spec=None)
     server = LitServer(api, accelerator="cpu", devices=1, timeout=10)
     with wrap_litserve_start(server) as server:
-        async with LifespanManager(server.app) as manager, AsyncClient(
-            transport=ASGITransport(app=manager.app), base_url="http://test"
-        ) as ac:
+        async with (
+            LifespanManager(server.app) as manager,
+            AsyncClient(transport=ASGITransport(app=manager.app), base_url="http://test") as ac,
+        ):
             response1 = ac.post("/predict", json={"input": 4.0})
             response2 = ac.post("/predict", json={"input": 5.0})
             response1, response2 = await asyncio.gather(response1, response2)
@@ -145,21 +148,27 @@ def test_max_batch_size_warning():
         UserWarning,
         match=warning,
     ):
-        LitServer(SimpleBatchLitAPI(), accelerator="cpu", devices=1, timeout=2)
+        SimpleBatchLitAPI()
 
     # Test no warnings are raised when max_batch_size is set and max_batch_size is not set
-    with pytest.raises(pytest.fail.Exception), pytest.warns(
-        UserWarning,
-        match=warning,
+    with (
+        pytest.raises(pytest.fail.Exception),
+        pytest.warns(
+            UserWarning,
+            match=warning,
+        ),
     ):
-        LitServer(SimpleBatchLitAPI(max_batch_size=2), accelerator="cpu", devices=1, timeout=2)
+        SimpleBatchLitAPI(max_batch_size=2)
 
     # Test no warning is set when LitAPI doesn't implement batch and unbatch
-    with pytest.raises(pytest.fail.Exception), pytest.warns(
-        UserWarning,
-        match=warning,
+    with (
+        pytest.raises(pytest.fail.Exception),
+        pytest.warns(
+            UserWarning,
+            match=warning,
+        ),
     ):
-        LitServer(SimpleTorchAPI(), accelerator="cpu", devices=1, timeout=2)
+        SimpleTorchAPI()
 
 
 def test_batch_predict_string_warning():
@@ -170,12 +179,12 @@ def test_batch_predict_string_warning():
 
     mock_input = torch.tensor([[1.0], [2.0]])
 
+    # Simulate the behavior in run_batched_loop
+    y = api.predict(mock_input)
     with pytest.warns(
         UserWarning,
         match="When batching is enabled, 'predict' must return a list to handle multiple inputs correctly.",
     ):
-        # Simulate the behavior in run_batched_loop
-        y = api.predict(mock_input)
         api.unbatch(y)
 
 
@@ -184,11 +193,23 @@ class FakeResponseQueue:
         raise StopIteration("exit loop")
 
 
+class FakeTransport(MessageTransport):
+    def __init__(self):
+        self.responses = []
+
+    async def areceive(self, **kwargs) -> dict:
+        raise NotImplementedError("This is a fake transport")
+
+    def send(self, response, consumer_id: int):
+        self.responses.append(response)
+
+
 def test_batched_loop():
     requests_queue = Queue()
     response_queue_id = 0
     requests_queue.put((response_queue_id, "uuid-1234", time.monotonic(), {"input": 4.0}))
     requests_queue.put((response_queue_id, "uuid-1235", time.monotonic(), {"input": 5.0}))
+    requests_queue.put(_SENTINEL_VALUE)
 
     lit_api_mock = MagicMock()
     lit_api_mock.request_timeout = 2
@@ -201,13 +222,17 @@ def test_batched_loop():
     lit_api_mock.encode_response = MagicMock(side_effect=lambda x: {"output": x})
 
     loop = BatchedLoop()
-    with patch("pickle.dumps", side_effect=StopIteration("exit loop")), pytest.raises(StopIteration, match="exit loop"):
-        loop.run_batched_loop(
-            lit_api_mock,
-            requests_queue,
-            [FakeResponseQueue()],
-            callback_runner=NOOP_CB_RUNNER,
-        )
+    transport = FakeTransport()
+    loop.run_batched_loop(
+        lit_api_mock,
+        requests_queue,
+        transport=transport,
+        callback_runner=NOOP_CB_RUNNER,
+    )
+
+    assert len(transport.responses) == 2, "response queue should have 2 responses"
+    assert transport.responses[0] == ("uuid-1234", ({"output": 16.0}, "OK", LoopResponseType.REGULAR))
+    assert transport.responses[1] == ("uuid-1235", ({"output": 25.0}, "OK", LoopResponseType.REGULAR))
 
     lit_api_mock.batch.assert_called_once()
     lit_api_mock.batch.assert_called_once_with([4.0, 5.0])
@@ -235,6 +260,15 @@ def test_collate_requests(batch_timeout, batch_size):
     assert len(timed_out_uids) == 0, "No timed out uids"
 
 
+def test_collate_requests_sentinel():
+    api = ls.test_examples.SimpleBatchedAPI(max_batch_size=2, batch_timeout=0)
+    api.request_timeout = 5
+    request_queue = Queue()
+    request_queue.put(_SENTINEL_VALUE)
+    with pytest.raises(_StopLoopError, match="Received sentinel value, stopping loop"):
+        collate_requests(api, request_queue)
+
+
 class BatchSizeMismatchAPI(SimpleBatchLitAPI):
     def predict(self, x):
         assert len(x) == 2, "Expected two concurrent inputs to be batched"
@@ -252,9 +286,10 @@ async def test_batch_size_mismatch():
     server = LitServer(api, accelerator="cpu", devices=1, timeout=10)
 
     with wrap_litserve_start(server) as server:
-        async with LifespanManager(server.app) as manager, AsyncClient(
-            transport=ASGITransport(app=manager.app), base_url="http://test"
-        ) as ac:
+        async with (
+            LifespanManager(server.app) as manager,
+            AsyncClient(transport=ASGITransport(app=manager.app), base_url="http://test") as ac,
+        ):
             response1 = ac.post("/predict", json={"input": 4.0})
             response2 = ac.post("/predict", json={"input": 5.0})
             response1, response2 = await asyncio.gather(response1, response2)

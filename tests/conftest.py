@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import base64
+import random
 import time
-from typing import Generator
+from collections.abc import Generator
 
 import psutil
 import pytest
@@ -23,6 +24,20 @@ from fastapi.testclient import TestClient
 from litserve.api import LitAPI
 from litserve.server import LitServer
 from litserve.utils import wrap_litserve_start
+
+
+def pytest_collection_modifyitems(config, items):
+    """Auto-mark tests based on their file path."""
+    for item in items:
+        # Get the relative path of the test file
+        test_path = item.fspath.relto(config.rootdir)
+
+        if "tests/unit/" in str(test_path):
+            item.add_marker(pytest.mark.unit)
+        elif "tests/integration/" in str(test_path):
+            item.add_marker(pytest.mark.integration)
+        elif "tests/e2e/" in str(test_path):
+            item.add_marker(pytest.mark.e2e)
 
 
 class SimpleLitAPI(LitAPI):
@@ -91,8 +106,18 @@ def simple_litapi():
 
 
 @pytest.fixture
+def simple_litapi_cls():
+    return SimpleLitAPI
+
+
+@pytest.fixture
+def simple_stream_cls():
+    return SimpleStreamAPI
+
+
+@pytest.fixture
 def simple_stream_api():
-    return SimpleStreamAPI()
+    return SimpleStreamAPI(stream=True)
 
 
 @pytest.fixture
@@ -338,3 +363,38 @@ def openai_embedding_request_data():
 @pytest.fixture
 def openai_embedding_request_data_array():
     return {"input": ["A beautiful sunset over the beach."] * 4, "model": "lit", "encoding_format": "float"}
+
+
+class MockEvent:
+    def set(self):
+        pass
+
+    def wait(self):
+        pass
+
+
+class MockQueue:
+    def put(self, item):
+        pass
+
+    def get(self, block=True, timeout=None):
+        pass
+
+
+@pytest.fixture
+def mock_manager():
+    class MockManager:
+        def __init__(self):
+            self.Queue = MockQueue
+            self.Event = MockEvent
+            self.dict = dict
+
+        def shutdown(self):
+            pass
+
+    return MockManager()
+
+
+@pytest.fixture
+def port():
+    return random.randint(10000, 65535)
